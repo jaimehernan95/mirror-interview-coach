@@ -1,7 +1,7 @@
-import { getDatabase } from "./mongodb";
+import { getDatabase, getMemoriesCollection } from "./mongodb";
 
 export const ATLAS_VECTOR_SEARCH_INDEX_DEFINITION = {
-  name: "vector_index",
+  name: "memory_vector_index",
   type: "vectorSearch",
   definition: {
     fields: [
@@ -29,6 +29,90 @@ export const ATLAS_VECTOR_SEARCH_INDEX_DEFINITION = {
 };
 
 /**
+ * Checks whether the Atlas Vector Search index 'memory_vector_index' (or 'vector_index') exists and is ready.
+ */
+export async function checkVectorSearchIndexStatus(): Promise<{
+  exists: boolean;
+  ready: boolean;
+  status: string;
+  indexName: string;
+  error?: string;
+}> {
+  try {
+    const col = await getMemoriesCollection();
+    const cursor = (col as any).listSearchIndexes();
+    const indexes = await cursor.toArray();
+
+    const vectorIndex = (indexes as any[]).find(
+      (idx: any) =>
+        idx.name === "memory_vector_index" ||
+        idx.name === "vector_index" ||
+        idx.type === "vectorSearch"
+    );
+
+    if (!vectorIndex) {
+      return {
+        exists: false,
+        ready: false,
+        status: "NOT_FOUND",
+        indexName: "memory_vector_index",
+        error: "Vector Search index 'memory_vector_index' has not been created in MongoDB Atlas yet.",
+      };
+    }
+
+    const rawStatus = (vectorIndex as any).status;
+    const isReady =
+      rawStatus === "READY" ||
+      rawStatus === "ACTIVE" ||
+      (vectorIndex as any).queryable === true;
+
+    return {
+      exists: true,
+      ready: isReady,
+      status: rawStatus || (isReady ? "READY" : "BUILDING"),
+      indexName: (vectorIndex as any).name || "memory_vector_index",
+    };
+  } catch (err: any) {
+    return {
+      exists: false,
+      ready: false,
+      status: "UNAVAILABLE",
+      indexName: "memory_vector_index",
+      error: err.message || String(err),
+    };
+  }
+}
+
+/**
+ * Attempts programmatic creation of the Atlas Vector Search index (MongoDB 6.0.11+ / 7.0+).
+ */
+export async function createProgrammaticVectorIndex(): Promise<{ success: boolean; message: string }> {
+  try {
+    const col = await getMemoriesCollection();
+    if (typeof (col as any).createSearchIndex === "function") {
+      await (col as any).createSearchIndex({
+        name: ATLAS_VECTOR_SEARCH_INDEX_DEFINITION.name,
+        type: ATLAS_VECTOR_SEARCH_INDEX_DEFINITION.type,
+        definition: ATLAS_VECTOR_SEARCH_INDEX_DEFINITION.definition,
+      });
+      return {
+        success: true,
+        message: "Programmatic Vector Search index creation command dispatched to Atlas.",
+      };
+    }
+    return {
+      success: false,
+      message: "Driver createSearchIndex not supported in this runtime; create via Atlas UI.",
+    };
+  } catch (err: any) {
+    return {
+      success: false,
+      message: err.message || String(err),
+    };
+  }
+}
+
+/**
  * Ensures standard compound indexes and TTL governance indexes exist in MongoDB Atlas.
  */
 export async function ensureAtlasIndexes(): Promise<{ success: boolean; created: string[] }> {
@@ -49,6 +133,7 @@ export async function ensureAtlasIndexes(): Promise<{ success: boolean; created:
     await db.collection("memories").createIndex({ memoryId: 1 }, { unique: true });
     await db.collection("memories").createIndex({ userId: 1, governanceStatus: 1, createdAt: -1 });
     await db.collection("memories").createIndex({ sourceSessionId: 1 });
+    
     // TTL Index: Automates the "how does it drop expired memories?" requirement
     await db.collection("memories").createIndex(
       { expiresAt: 1 },

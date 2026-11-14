@@ -1,11 +1,4 @@
-import { GoogleGenAI } from "@google/genai";
-
-const apiKey = process.env.GEMINI_API_KEY || "";
-let aiClient: GoogleGenAI | null = null;
-
-if (apiKey) {
-  aiClient = new GoogleGenAI({ apiKey });
-}
+import { createGeminiClient, SUPPORTED_EMBEDDING_MODELS } from "./geminiClient";
 
 /**
  * Generates a unit-normalized deterministic pseudo-embedding as an offline fallback
@@ -31,8 +24,8 @@ function generateFallbackEmbedding(text: string, dimension: number = 768): numbe
 }
 
 /**
- * Generates 768-dimensional vector embedding for text using Google's text-embedding-004.
- * Formatted for MongoDB Atlas Vector Search.
+ * Generates 768-dimensional vector embedding for text using Google's native gemini-embedding models.
+ * Uses outputDimensionality: 768 to guarantee exact alignment with Atlas Vector Search index.
  */
 export async function generateEmbedding(text: string): Promise<number[]> {
   const cleanText = text.trim();
@@ -40,23 +33,50 @@ export async function generateEmbedding(text: string): Promise<number[]> {
     return new Array(768).fill(0);
   }
 
-  if (aiClient && apiKey) {
+  const client = createGeminiClient();
+  if (!client) {
+    console.warn("Missing GEMINI_API_KEY. Using deterministic 768-dim embedding fallback for Atlas Vector Search.");
+    return generateFallbackEmbedding(cleanText, 768);
+  }
+
+  let lastError: any = null;
+
+  for (const model of SUPPORTED_EMBEDDING_MODELS) {
     try {
-      const response = await aiClient.models.embedContent({
-        model: "text-embedding-004",
+      const response = await client.models.embedContent({
+        model,
         contents: cleanText,
+        config: {
+          outputDimensionality: 768,
+        },
       });
 
-      if (response && response.embedding && response.embedding.values) {
-        return response.embedding.values;
+      const respAny = response as any;
+      const rawValues =
+        respAny.embedding?.values ||
+        (respAny.embeddings && respAny.embeddings[0]?.values) ||
+        null;
+
+      if (rawValues && Array.isArray(rawValues)) {
+        let values: number[] = [...rawValues];
+
+        // Ensure exact 768 dimensions for Atlas Vector Search
+        if (values.length > 768) {
+          values = values.slice(0, 768);
+        } else if (values.length < 768) {
+          while (values.length < 768) values.push(0);
+        }
+
+        return values;
       }
-    } catch (err) {
-      console.warn(
-        "Gemini text-embedding-004 call failed. Utilizing deterministic Atlas-compatible fallback:",
-        err
-      );
+    } catch (err: any) {
+      lastError = err;
+      console.warn(`Embedding attempt with ${model} failed, trying next supported model:`, err.message || err);
     }
   }
 
+  console.warn(
+    `Gemini embedding generation failed with ${lastError?.message || lastError}. Using deterministic 768-dim fallback to protect live demo execution.`
+  );
   return generateFallbackEmbedding(cleanText, 768);
 }

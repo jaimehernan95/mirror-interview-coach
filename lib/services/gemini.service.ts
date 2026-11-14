@@ -1,15 +1,8 @@
-import { GoogleGenAI } from "@google/genai";
 import { QuestionItem } from "@/types/session";
 import { Memory, MemoryCategory } from "@/types/memory";
 import { Telemetry } from "@/types/telemetry";
 import { LangSmithService } from "./langsmith.service";
-
-const apiKey = process.env.GEMINI_API_KEY || "";
-let aiClient: GoogleGenAI | null = null;
-
-if (apiKey) {
-  aiClient = new GoogleGenAI({ apiKey });
-}
+import { createGeminiClient, SUPPORTED_GENERATION_MODELS } from "./geminiClient";
 
 export interface ContentEvaluation {
   contentScore: number; // 0 to 60
@@ -26,6 +19,44 @@ export interface ExtractedMemoryDraft {
 
 export class GeminiService {
   /**
+   * Helper to run generation across supported model names in v1beta (Gemini 2.0 / 1.5).
+   */
+  private static async generateWithModelFallback(params: {
+    prompt: string;
+    responseMimeType?: string;
+  }): Promise<string> {
+    const client = createGeminiClient();
+    if (!client) {
+      throw new Error("Missing GEMINI_API_KEY. Configure it in .env.local");
+    }
+
+    let lastError: any = null;
+
+    for (const model of SUPPORTED_GENERATION_MODELS) {
+      try {
+        const response = await client.models.generateContent({
+          model,
+          contents: params.prompt,
+          config: params.responseMimeType
+            ? { responseMimeType: params.responseMimeType }
+            : undefined,
+        });
+
+        if (response && response.text) {
+          return response.text;
+        }
+      } catch (err: any) {
+        lastError = err;
+        console.warn(`Generation attempt with ${model} failed, trying next:`, err.message || err);
+      }
+    }
+
+    throw new Error(
+      `Gemini content generation failed across all models (${SUPPORTED_GENERATION_MODELS.join(", ")}): ${lastError?.message || lastError}`
+    );
+  }
+
+  /**
    * Synthesize progressive interview questions based on resume and job description.
    */
   static async generateQuestions(params: {
@@ -41,10 +72,6 @@ export class GeminiService {
       "llm",
       { targetRole, count },
       async () => {
-        if (!aiClient || !apiKey) {
-          return this.getFallbackQuestions(targetRole);
-        }
-
         const prompt = `You are a Principal Bar-Raiser Interviewer.
 Generate ${count} progressive interview questions for a candidate applying for: "${targetRole}".
 
@@ -70,21 +97,18 @@ Return ONLY a valid JSON array matching this exact schema, with no markdown back
 ]`;
 
         try {
-          const response = await aiClient.models.generateContent({
-            model: "gemini-1.5-flash",
-            contents: prompt,
-            config: {
-              responseMimeType: "application/json",
-            },
+          const rawText = await this.generateWithModelFallback({
+            prompt,
+            responseMimeType: "application/json",
           });
 
-          const rawText = response.text || "[]";
-          const parsed = JSON.parse(rawText) as QuestionItem[];
+          const cleaned = rawText.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+          const parsed = JSON.parse(cleaned) as QuestionItem[];
           if (Array.isArray(parsed) && parsed.length > 0) {
             return parsed.slice(0, count);
           }
-        } catch (error) {
-          console.warn("Gemini question generation error, using fallback:", error);
+        } catch (err) {
+          console.warn("Gemini generation failed, using structured fallbacks:", err);
         }
 
         return this.getFallbackQuestions(targetRole);
@@ -108,10 +132,6 @@ Return ONLY a valid JSON array matching this exact schema, with no markdown back
       "llm",
       { questionText, retrievedMemoriesCount: retrievedMemories.length },
       async () => {
-        if (!aiClient || !apiKey) {
-          return this.getFallbackContentEvaluation(transcript);
-        }
-
         const memoryContext = retrievedMemories.length
           ? retrievedMemories.map((m) => `- Past Habit / Observation: "${m.observation}"`).join("\n")
           : "None. First observed session for this user.";
@@ -151,16 +171,13 @@ Return ONLY valid JSON matching this schema with no markdown formatting:
 }`;
 
         try {
-          const response = await aiClient.models.generateContent({
-            model: "gemini-1.5-flash",
-            contents: prompt,
-            config: {
-              responseMimeType: "application/json",
-            },
+          const rawText = await this.generateWithModelFallback({
+            prompt,
+            responseMimeType: "application/json",
           });
 
-          const rawText = response.text || "{}";
-          const parsed = JSON.parse(rawText) as ContentEvaluation;
+          const cleaned = rawText.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
+          const parsed = JSON.parse(cleaned) as ContentEvaluation;
           if (typeof parsed.contentScore === "number") {
             return {
               contentScore: Math.min(60, Math.max(10, parsed.contentScore)),
@@ -169,8 +186,8 @@ Return ONLY valid JSON matching this schema with no markdown formatting:
               rubricBreakdown: parsed.rubricBreakdown || [],
             };
           }
-        } catch (error) {
-          console.warn("Gemini content evaluation error, using fallback:", error);
+        } catch (err) {
+          console.warn("Gemini evaluation error, using calibrated fallback:", err);
         }
 
         return this.getFallbackContentEvaluation(transcript);
@@ -187,9 +204,8 @@ Return ONLY valid JSON matching this schema with no markdown formatting:
     deliveryScore: number;
     contentScore: number;
   }): Promise<ExtractedMemoryDraft> {
-    const { transcript, telemetry, deliveryScore, contentScore } = params;
+    const { transcript, telemetry, contentScore } = params;
 
-    // Fast deterministic heuristic fallback
     const observations: string[] = [];
     let category: MemoryCategory = "delivery";
 
@@ -228,7 +244,6 @@ Return ONLY valid JSON matching this schema with no markdown formatting:
     };
   }
 
-  // Fallbacks for offline demo reliability
   private static getFallbackQuestions(targetRole: string): QuestionItem[] {
     return [
       {

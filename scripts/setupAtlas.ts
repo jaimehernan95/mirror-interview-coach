@@ -1,4 +1,9 @@
-import { ensureAtlasIndexes, ATLAS_VECTOR_SEARCH_INDEX_DEFINITION } from "../lib/db/atlasIndexes";
+import {
+  ensureAtlasIndexes,
+  checkVectorSearchIndexStatus,
+  createProgrammaticVectorIndex,
+  ATLAS_VECTOR_SEARCH_INDEX_DEFINITION,
+} from "../lib/db/atlasIndexes";
 
 async function main() {
   console.log("==================================================");
@@ -8,10 +13,17 @@ async function main() {
 
   try {
     const res = await ensureAtlasIndexes();
-    console.log("✅ Standard and TTL indexes created successfully:", res.created);
-    console.log("\nAtlas Vector Search Index Definition:");
+    console.log("✅ Standard compound and TTL indexes created:", res.created);
+
+    const prog = await createProgrammaticVectorIndex();
+    console.log("ℹ️ Programmatic vector index attempt:", prog.message);
+
+    const status = await checkVectorSearchIndexStatus();
+    console.log("\nVector Search Index Status:", status);
+
+    console.log("\nAtlas Vector Search Index Definition required for 'memories':");
     console.log(JSON.stringify(ATLAS_VECTOR_SEARCH_INDEX_DEFINITION, null, 2));
-    console.log("\nCopy the JSON above into Atlas Search & Vector Search tab if not automated.");
+
     process.exit(0);
   } catch (error) {
     console.error("❌ Failed to setup Atlas indexes:", error);

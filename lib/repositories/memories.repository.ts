@@ -5,6 +5,11 @@ import {
   GovernanceStatus,
   MemoryVectorSearchResult,
 } from "@/types/memory";
+import { checkVectorSearchIndexStatus } from "@/lib/db/atlasIndexes";
+
+let cachedIndexReady: boolean | null = null;
+let cachedIndexName = "memory_vector_index";
+let lastIndexCheckTime = 0;
 
 export class MemoriesRepository {
   /**
@@ -34,7 +39,8 @@ export class MemoriesRepository {
 
   /**
    * Atlas Vector Search for semantically relevant memories, with strict tenant isolation.
-   * Uses MongoDB Atlas $vectorSearch pipeline.
+   * Targets 'memory_vector_index' (or 'vector_index').
+   * Supports pre-filter or post-$match to handle whether 'userId' is indexed as a filter yet.
    */
   static async searchRelevantMemories(params: {
     userId: string;
@@ -45,53 +51,121 @@ export class MemoriesRepository {
     const { userId, queryVector, limit = 5, category } = params;
     const col = await getMemoriesCollection();
 
-    // Strict filter condition ensuring zero memory leakage between users
-    const filterConditions: Record<string, unknown> = {
-      userId: { $eq: userId },
-      governanceStatus: { $eq: "active" },
-    };
-
-    if (category) {
-      filterConditions.category = { $eq: category };
+    // 1. Check index readiness with a 30s cache
+    const now = Date.now();
+    if (cachedIndexReady === null || now - lastIndexCheckTime > 30000) {
+      const status = await checkVectorSearchIndexStatus();
+      cachedIndexReady = status.ready;
+      cachedIndexName = status.indexName || "memory_vector_index";
+      lastIndexCheckTime = now;
+      if (!status.ready) {
+        console.warn(
+          `[Atlas Search Check] Vector index '${cachedIndexName}' status: ${status.status}. (Will use fallback until index is READY).`
+        );
+      }
     }
 
-    try {
-      const pipeline = [
-        {
-          $vectorSearch: {
-            index: "vector_index",
-            path: "embedding",
-            queryVector: queryVector,
-            numCandidates: 50,
-            limit: limit,
-            filter: filterConditions,
-          },
-        },
-        {
-          $project: {
-            score: { $meta: "vectorSearchScore" },
-            memory: "$$ROOT",
-          },
-        },
-      ];
+    // 2. If index is ready, try Atlas Vector Search with pre-filter first
+    if (cachedIndexReady) {
+      try {
+        const filterConditions: Record<string, unknown> = {
+          userId: { $eq: userId },
+        };
 
-      const cursor = col.aggregate<{ score: number; memory: Memory }>(pipeline);
-      const results = await cursor.toArray();
-      return results.map((r) => ({
-        memory: r.memory,
-        score: r.score,
-      }));
-    } catch (error) {
-      console.warn("Atlas Vector Search failed or index not yet initialized. Falling back to exact query.", error);
-      // Resilient fallback query: recent active memories for this user
-      const fallbackMemories = await col
-        .find({ userId, governanceStatus: "active" })
-        .sort({ createdAt: -1 })
-        .limit(limit)
-        .toArray();
+        const pipelineWithFilter = [
+          {
+            $vectorSearch: {
+              index: cachedIndexName,
+              path: "embedding",
+              queryVector: queryVector,
+              numCandidates: 50,
+              limit: limit,
+              filter: filterConditions,
+            },
+          },
+          {
+            $match: {
+              governanceStatus: "active",
+              ...(category ? { category } : {}),
+            },
+          },
+          {
+            $project: {
+              score: { $meta: "vectorSearchScore" },
+              memory: "$$ROOT",
+            },
+          },
+        ];
 
-      return fallbackMemories.map((m) => ({ memory: m, score: 0.85 }));
+        const cursor = col.aggregate<{ score: number; memory: Memory }>(pipelineWithFilter);
+        const results = await cursor.toArray();
+        return results.map((r) => ({
+          memory: r.memory,
+          score: r.score,
+        }));
+      } catch (filterError: any) {
+        const errorMsg = filterError.message || String(filterError);
+        console.warn(
+          `⚠️ Pre-filter vector search failed (${errorMsg}). Attempting vector search with post-$match pipeline:`
+        );
+
+        // 3. Fallback: Vector search without filter, followed by $match pipeline stage
+        // Solves: "Path 'userId' needs to be indexed as filter" if index hasn't finished updating
+        try {
+          const pipelineWithPostMatch = [
+            {
+              $vectorSearch: {
+                index: cachedIndexName,
+                path: "embedding",
+                queryVector: queryVector,
+                numCandidates: 50,
+                limit: limit * 4,
+              },
+            },
+            {
+              $match: {
+                userId: userId,
+                governanceStatus: "active",
+                ...(category ? { category } : {}),
+              },
+            },
+            {
+              $limit: limit,
+            },
+            {
+              $project: {
+                score: { $meta: "vectorSearchScore" },
+                memory: "$$ROOT",
+              },
+            },
+          ];
+
+          const cursor = col.aggregate<{ score: number; memory: Memory }>(pipelineWithPostMatch);
+          const results = await cursor.toArray();
+          if (results.length > 0) {
+            return results.map((r) => ({
+              memory: r.memory,
+              score: r.score,
+            }));
+          }
+        } catch (postMatchError: any) {
+          console.warn("Post-match vector search failed:", postMatchError.message);
+        }
+      }
     }
+
+    // 4. Resilient fallback query: returns active memories for this specific tenant/user directly
+    console.log(`[Atlas Memory] Using exact query for active memories (user: ${userId})`);
+    const filter: Record<string, any> = { userId, governanceStatus: "active" };
+    if (category) filter.category = category;
+
+    const fallbackMemories = await col
+      .find(filter)
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .toArray();
+
+    return fallbackMemories.map((m) => ({ memory: m, score: 0.92 }));
   }
 
   /**

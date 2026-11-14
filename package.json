@@ -10,7 +10,7 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "@google/genai": "^0.1.2",
+    "@google/genai": "^3.3.0",
     "clsx": "^2.1.1",
     "langsmith": "^0.3.8",
     "lucide-react": "^0.468.0",

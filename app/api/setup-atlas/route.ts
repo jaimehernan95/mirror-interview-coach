@@ -1,5 +1,10 @@
 import { NextResponse } from "next/server";
-import { ensureAtlasIndexes, ATLAS_VECTOR_SEARCH_INDEX_DEFINITION } from "@/lib/db/atlasIndexes";
+import {
+  ensureAtlasIndexes,
+  checkVectorSearchIndexStatus,
+  createProgrammaticVectorIndex,
+  ATLAS_VECTOR_SEARCH_INDEX_DEFINITION,
+} from "@/lib/db/atlasIndexes";
 import { getDatabase } from "@/lib/db/mongodb";
 
 export async function GET() {
@@ -7,18 +12,28 @@ export async function GET() {
     const db = await getDatabase();
     await db.command({ ping: 1 });
 
+    const vectorStatus = await checkVectorSearchIndexStatus();
+
     return NextResponse.json({
       status: "healthy",
       database: db.databaseName,
-      message: "Connected to MongoDB Atlas successfully.",
-      vectorIndexConfig: ATLAS_VECTOR_SEARCH_INDEX_DEFINITION,
+      message: "Connected to MongoDB Atlas cluster.",
+      vectorSearchStatus: vectorStatus,
+      requiredIndexDefinition: ATLAS_VECTOR_SEARCH_INDEX_DEFINITION,
+      atlasUiInstructions: {
+        step1: "Log into cloud.mongodb.com and open Cluster0",
+        step2: "Click 'Search & Vector Search' (or 'Atlas Search')",
+        step3: "Click 'Create Search Index' -> 'Atlas Vector Search' -> 'JSON Editor'",
+        step4: "Select database 'interview_coach' and collection 'memories'",
+        step5: "Name the index 'vector_index' and paste requiredIndexDefinition",
+      },
     });
-  } catch (error) {
+  } catch (error: any) {
     return NextResponse.json(
       {
         status: "degraded",
-        error: String(error),
-        message: "FastAPI / Next.js is running, but MongoDB Atlas is unreachable. Verify MONGODB_URI in .env.local",
+        error: error.message || String(error),
+        message: "MongoDB Atlas connection failed. Verify MONGODB_URI in .env.local",
       },
       { status: 500 }
     );
@@ -27,17 +42,21 @@ export async function GET() {
 
 export async function POST() {
   try {
-    const result = await ensureAtlasIndexes();
+    const standardIndexes = await ensureAtlasIndexes();
+    const programmaticResult = await createProgrammaticVectorIndex();
+    const vectorStatus = await checkVectorSearchIndexStatus();
+
     return NextResponse.json({
       success: true,
-      message: "MongoDB Atlas indexes initialized successfully.",
-      createdIndexes: result.created,
-      vectorSearchDefinition: ATLAS_VECTOR_SEARCH_INDEX_DEFINITION,
+      standardIndexes: standardIndexes.created,
+      programmaticVectorIndexAttempt: programmaticResult,
+      currentVectorIndexStatus: vectorStatus,
+      requiredIndexDefinition: ATLAS_VECTOR_SEARCH_INDEX_DEFINITION,
     });
-  } catch (error) {
+  } catch (error: any) {
     console.error("Atlas index setup error:", error);
     return NextResponse.json(
-      { error: "Failed to create Atlas indexes", details: String(error) },
+      { error: "Failed to setup Atlas indexes", details: error.message || String(error) },
       { status: 500 }
     );
   }

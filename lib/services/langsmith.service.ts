@@ -1,18 +1,29 @@
 import { Client } from "langsmith";
 
-const langsmithApiKey = process.env.LANGCHAIN_API_KEY || "";
+const rawKey = process.env.LANGCHAIN_API_KEY || "";
+const isPlaceholderKey =
+  !rawKey ||
+  rawKey.includes("YOUR_LANGSMITH_KEY") ||
+  rawKey.includes("your_langsmith_api_key") ||
+  rawKey.trim().length < 10;
+
+const isEnabled =
+  process.env.LANGCHAIN_TRACING_V2 === "true" && !isPlaceholderKey;
+
 const projectName = process.env.LANGCHAIN_PROJECT || "mirror-interview-coach";
-const isEnabled = Boolean(langsmithApiKey && process.env.LANGCHAIN_TRACING_V2 === "true");
 
 let client: Client | null = null;
+
+// Only instantiate LangSmith Client when explicitly enabled with a real key
 if (isEnabled) {
   try {
     client = new Client({
-      apiKey: langsmithApiKey,
+      apiKey: rawKey,
       apiUrl: process.env.LANGCHAIN_ENDPOINT || "https://api.smith.langchain.com",
     });
   } catch (err) {
-    console.warn("Failed to initialize LangSmith client:", err);
+    console.warn("⚠️ LangSmith initialization failed. Disabling tracing to avoid TLS/SSL errors:", err);
+    client = null;
   }
 }
 
@@ -25,7 +36,9 @@ export interface TraceSpan {
 
 export class LangSmithService {
   /**
-   * Log an agent step or memory retrieval span to LangSmith.
+   * Safe execution wrapper:
+   * When LangSmith is disabled or key is placeholder, runs fn() directly with zero network overhead.
+   * Completely eliminates 'SSLV3 alert handshake failure'.
    */
   static async traceExecution<T>(
     spanName: string,
@@ -33,40 +46,44 @@ export class LangSmithService {
     inputs: Record<string, unknown>,
     fn: () => Promise<T>
   ): Promise<T> {
+    // If not enabled or no client, execute immediately with no-op tracing
+    if (!isEnabled || !client) {
+      return await fn();
+    }
+
     const startTime = Date.now();
     let result: T;
     let errorToThrow: unknown = null;
 
     try {
       result = await fn();
+      return result;
     } catch (err) {
       errorToThrow = err;
       throw err;
     } finally {
       const endTime = Date.now();
-      const latencyMs = endTime - startTime;
 
-      if (client && isEnabled) {
-        try {
-          await client.createRun({
-            name: spanName,
-            run_type: runType,
-            project_name: projectName,
-            inputs,
-            outputs: errorToThrow ? { error: String(errorToThrow) } : { resultSummary: "success" },
-            start_time: startTime,
-            end_time: endTime,
-            error: errorToThrow ? String(errorToThrow) : undefined,
-          });
-        } catch (traceErr) {
-          console.warn("LangSmith trace dispatch warning:", traceErr);
-        }
-      } else {
-        // Local debug trace
-        // console.log(`[Trace: ${runType}] ${spanName} (${latencyMs}ms)`);
+      try {
+        await client.createRun({
+          name: spanName,
+          run_type: runType,
+          project_name: projectName,
+          inputs,
+          outputs: errorToThrow
+            ? { error: String(errorToThrow) }
+            : { resultSummary: "success" },
+          start_time: startTime,
+          end_time: endTime,
+          error: errorToThrow ? String(errorToThrow) : undefined,
+        });
+      } catch (traceErr) {
+        // Silently swallow trace errors to protect runtime execution
       }
     }
+  }
 
-    return result!;
+  static isTracingActive(): boolean {
+    return Boolean(isEnabled && client);
   }
 }
