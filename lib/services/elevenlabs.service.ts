@@ -4,7 +4,6 @@
  */
 
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || "";
-// Default to 'Rachel' (calm, clear professional coach voice) or custom voice ID
 const DEFAULT_VOICE_ID = process.env.ELEVENLABS_VOICE_ID || "21m00Tcm4TlvDq8ikWAM";
 
 export interface GenerateSpeechResult {
@@ -17,7 +16,7 @@ export interface GenerateSpeechResult {
 export class ElevenLabsService {
   /**
    * Synthesize spoken audio for coaching feedback via ElevenLabs API.
-   * Returns audio buffer (MP3) or signals fallback if key is missing/unconfigured.
+   * Returns audio buffer (MP3) or signals fallback if key is missing/unconfigured or network fails.
    */
   static async generateCoachVoice(
     text: string,
@@ -37,6 +36,9 @@ export class ElevenLabsService {
     }
 
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 2500);
+
       const response = await fetch(
         `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}?output_format=mp3_44100_128`,
         {
@@ -55,37 +57,42 @@ export class ElevenLabsService {
               use_speaker_boost: true,
             },
           }),
+          signal: controller.signal,
         }
       );
 
+      clearTimeout(timeoutId);
+
       if (!response.ok) {
-        const errorText = await response.text();
-        console.warn(`ElevenLabs API error (${response.status}):`, errorText);
+        const errorText = await response.text().catch(() => "");
+        console.warn(`ElevenLabs API returned ${response.status}: ${errorText}. Using Web Speech fallback.`);
         return {
           fallback: true,
           mimeType: "audio/mpeg",
-          message: `ElevenLabs API error (${response.status}). Using browser speech fallback.`,
+          message: `ElevenLabs API error (${response.status}). Using fallback.`,
         };
       }
 
       const arrayBuffer = await response.arrayBuffer();
+      const audioBuffer = Buffer.from(arrayBuffer);
+
       return {
-        audioBuffer: Buffer.from(arrayBuffer),
+        audioBuffer,
         mimeType: "audio/mpeg",
         fallback: false,
       };
     } catch (err: any) {
-      console.warn("ElevenLabs network failure, using fallback:", err.message || err);
+      console.warn("ElevenLabs network failure, using fallback:", err?.message || err);
       return {
         fallback: true,
         mimeType: "audio/mpeg",
-        message: err.message || "ElevenLabs network error",
+        message: "Network failure reaching ElevenLabs. Using fallback voice.",
       };
     }
   }
 
   /**
-   * Synthesizes a punchy, spoken audio script comparing Session N vs Session N-1.
+   * Helper to format a coach voice critique prompt based on telemetry and feedback.
    */
   static composeSpokenFeedbackScript(params: {
     wpm: number;
@@ -95,36 +102,44 @@ export class ElevenLabsService {
     gazePct: number;
     growthArea?: string;
   }): string {
-    const { wpm, fillerCount, fillerReductionPct, gazePct, growthArea } = params;
-    const lines: string[] = [];
+    const { wpm, fillerCount, fillerReductionPct = 0, gazePct, growthArea = "consistent pacing" } = params;
 
-    // Pacing sentence
+    let script = "";
+
+    if (fillerReductionPct > 0) {
+      script += `Outstanding progress! Your verbal fillers decreased by ${fillerReductionPct} percent. `;
+    } else if (fillerCount <= 2) {
+      script += "Excellent delivery control with minimal filler words. ";
+    } else {
+      script += `You registered ${fillerCount} filler words. Practice replacing fillers with deliberate pauses. `;
+    }
+
     if (wpm >= 130 && wpm <= 155) {
-      lines.push(`Your pace was well controlled at ${wpm} words per minute.`);
+      script += `Your pacing was locked at an optimal ${wpm} words per minute. `;
     } else if (wpm > 155) {
-      lines.push(`You spoke at a rapid pace of ${wpm} words per minute. Aim to pause and slow your tempo.`);
+      script += `Your pace was slightly rushed at ${wpm} words per minute. Try easing your tempo. `;
     } else {
-      lines.push(`Your pace was ${wpm} words per minute. Aim for a slightly crisper cadence.`);
+      script += `Your speaking rate was ${wpm} words per minute. Aim for 130 to 155 words per minute. `;
     }
 
-    // Filler / Improvement sentence
-    if (fillerReductionPct && fillerReductionPct > 0) {
-      lines.push(`Great work: verbal filler words dropped by ${fillerReductionPct} percent.`);
-    } else if (fillerCount > 4) {
-      lines.push(`You had ${fillerCount} verbal filler words. Practice replacing them with intentional silent pauses.`);
-    }
-
-    // Gaze sentence
     if (gazePct >= 80) {
-      lines.push("Camera eye contact was steady and authoritative.");
+      script += `Camera eye contact was steady at ${gazePct} percent. `;
     } else {
-      lines.push("Eye contact remains your biggest growth area. Keep your gaze anchored to the camera lens.");
+      script += `Eye contact was at ${gazePct} percent. Keep your gaze anchored directly to the camera lens. `;
     }
 
-    if (growthArea) {
-      lines.push(`Focus next on: ${growthArea}.`);
-    }
+    script += `For your next answer, prioritize: ${growthArea}.`;
 
-    return lines.join(" ");
+    return script;
+  }
+
+  static formatCoachingScript(params: {
+    wpm: number;
+    fillerCount: number;
+    fillerReductionPct?: number;
+    gazePct: number;
+    growthArea: string;
+  }): string {
+    return this.composeSpokenFeedbackScript(params);
   }
 }

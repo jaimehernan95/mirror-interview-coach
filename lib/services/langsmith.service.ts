@@ -38,7 +38,7 @@ export class LangSmithService {
   /**
    * Safe execution wrapper:
    * When LangSmith is disabled or key is placeholder, runs fn() directly with zero network overhead.
-   * Completely eliminates 'SSLV3 alert handshake failure'.
+   * Runs createRun asynchronously without blocking user response.
    */
   static async traceExecution<T>(
     spanName: string,
@@ -46,7 +46,6 @@ export class LangSmithService {
     inputs: Record<string, unknown>,
     fn: () => Promise<T>
   ): Promise<T> {
-    // If not enabled or no client, execute immediately with no-op tracing
     if (!isEnabled || !client) {
       return await fn();
     }
@@ -64,8 +63,9 @@ export class LangSmithService {
     } finally {
       const endTime = Date.now();
 
+      // Fire-and-forget: do NOT await client.createRun so network/Wi-Fi latency never blocks the HTTP response!
       try {
-        await client.createRun({
+        client.createRun({
           name: spanName,
           run_type: runType,
           project_name: projectName,
@@ -76,14 +76,10 @@ export class LangSmithService {
           start_time: startTime,
           end_time: endTime,
           error: errorToThrow ? String(errorToThrow) : undefined,
-        });
-      } catch (traceErr) {
-        // Silently swallow trace errors to protect runtime execution
+        }).catch(() => {});
+      } catch {
+        // ignore background trace errors
       }
     }
-  }
-
-  static isTracingActive(): boolean {
-    return Boolean(isEnabled && client);
   }
 }

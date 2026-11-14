@@ -2,7 +2,7 @@ import { createGeminiClient, SUPPORTED_EMBEDDING_MODELS } from "./geminiClient";
 
 /**
  * Generates a unit-normalized deterministic pseudo-embedding as an offline fallback
- * if Gemini API key is missing or network is unavailable during demos.
+ * if Gemini API key is missing or network/Wi-Fi times out.
  */
 function generateFallbackEmbedding(text: string, dimension: number = 768): number[] {
   let hash = 0;
@@ -25,7 +25,7 @@ function generateFallbackEmbedding(text: string, dimension: number = 768): numbe
 
 /**
  * Generates 768-dimensional vector embedding for text using Google's native gemini-embedding models.
- * Uses outputDimensionality: 768 to guarantee exact alignment with Atlas Vector Search index.
+ * Protected by a strict 2.0-second timeout to prevent Wi-Fi latency or SDK hangs from delaying evaluation.
  */
 export async function generateEmbedding(text: string): Promise<number[]> {
   const cleanText = text.trim();
@@ -35,22 +35,27 @@ export async function generateEmbedding(text: string): Promise<number[]> {
 
   const client = createGeminiClient();
   if (!client) {
-    console.warn("Missing GEMINI_API_KEY. Using deterministic 768-dim embedding fallback for Atlas Vector Search.");
     return generateFallbackEmbedding(cleanText, 768);
   }
 
-  let lastError: any = null;
+  const model = SUPPORTED_EMBEDDING_MODELS[0] || "gemini-embedding-001";
 
-  for (const model of SUPPORTED_EMBEDDING_MODELS) {
-    try {
-      const response = await client.models.embedContent({
-        model,
-        contents: cleanText,
-        config: {
-          outputDimensionality: 768,
-        },
-      });
+  try {
+    const embedPromise = client.models.embedContent({
+      model,
+      contents: cleanText,
+      config: {
+        outputDimensionality: 768,
+      },
+    });
 
+    const timeoutPromise = new Promise<null>((resolve) =>
+      setTimeout(() => resolve(null), 2000)
+    );
+
+    const response = await Promise.race([embedPromise, timeoutPromise]);
+
+    if (response) {
       const respAny = response as any;
       const rawValues =
         respAny.embedding?.values ||
@@ -59,24 +64,18 @@ export async function generateEmbedding(text: string): Promise<number[]> {
 
       if (rawValues && Array.isArray(rawValues)) {
         let values: number[] = [...rawValues];
-
-        // Ensure exact 768 dimensions for Atlas Vector Search
         if (values.length > 768) {
           values = values.slice(0, 768);
         } else if (values.length < 768) {
           while (values.length < 768) values.push(0);
         }
-
         return values;
       }
-    } catch (err: any) {
-      lastError = err;
-      console.warn(`Embedding attempt with ${model} failed, trying next supported model:`, err.message || err);
     }
+  } catch (err: any) {
+    console.warn(`Embedding call to ${model} failed or timed out (${err?.message || err}). Using fallback vector.`);
   }
 
-  console.warn(
-    `Gemini embedding generation failed with ${lastError?.message || lastError}. Using deterministic 768-dim fallback to protect live demo execution.`
-  );
+  // Instant deterministic 768-dim fallback
   return generateFallbackEmbedding(cleanText, 768);
 }

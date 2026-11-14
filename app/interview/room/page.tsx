@@ -43,7 +43,15 @@ export default function InterviewRoomPage() {
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const animFrameRef = useRef<number | null>(null);
+
   const [isCameraActive, setIsCameraActive] = useState(false);
+
+  // Live Audio Metering & Mouth Movement State
+  const [audioVolume, setAudioVolume] = useState(0);
+  const [isSpeaking, setIsSpeaking] = useState(false);
 
   // Gauntlet State Machine: "SETUP" | "PREP" | "RECORDING" | "COMPLETE"
   const [gauntletState, setGauntletState] = useState<GauntletModeState>("SETUP");
@@ -148,13 +156,64 @@ export default function InterviewRoomPage() {
     }
   }, []);
 
+  // Web Audio visualizer setup
+  const setupAudioMeter = (stream: MediaStream) => {
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+
+      const audioCtx = new AudioCtx();
+      audioContextRef.current = audioCtx;
+
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 128;
+      analyserRef.current = analyser;
+
+      const source = audioCtx.createMediaStreamSource(stream);
+      source.connect(analyser);
+
+      const bufferLength = analyser.frequencyBinCount;
+      const dataArray = new Uint8Array(bufferLength);
+
+      const checkVolume = () => {
+        if (!analyserRef.current) return;
+        analyserRef.current.getByteFrequencyData(dataArray);
+
+        let sum = 0;
+        for (let i = 0; i < bufferLength; i++) {
+          sum += dataArray[i];
+        }
+        const avg = sum / bufferLength;
+        const normalized = Math.min(1, avg / 80);
+        setAudioVolume(normalized);
+        setIsSpeaking(normalized > 0.08);
+
+        animFrameRef.current = requestAnimationFrame(checkVolume);
+      };
+
+      checkVolume();
+    } catch (err) {
+      console.warn("Web Audio API metering not available:", err);
+    }
+  };
+
   // Stop camera and microphone hardware tracks
   const stopMediaDevices = useCallback(() => {
+    if (animFrameRef.current) {
+      cancelAnimationFrame(animFrameRef.current);
+      animFrameRef.current = null;
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close().catch(() => {});
+      audioContextRef.current = null;
+    }
     if (mediaStreamRef.current) {
       mediaStreamRef.current.getTracks().forEach((track) => track.stop());
       mediaStreamRef.current = null;
     }
     setIsCameraActive(false);
+    setIsSpeaking(false);
+    setAudioVolume(0);
   }, []);
 
   // Initialize Webcam & Microphone
@@ -171,9 +230,10 @@ export default function InterviewRoomPage() {
         if (videoRef.current) {
           videoRef.current.srcObject = mediaStream;
         }
+        setupAudioMeter(mediaStream);
         setIsCameraActive(true);
       } catch (err) {
-        console.warn("Camera permission denied, using telemetry simulation:", err);
+        console.warn("Camera permission denied, using telemetry simulator:", err);
       }
     }
   };
@@ -198,7 +258,6 @@ export default function InterviewRoomPage() {
       gauntletStateRef.current = "PREP";
       setPrepSecondsRemaining(STANDARD_PREP_SECONDS);
 
-      // Customize preset answers per question for seamless live demo
       if (stageIdx === 1) {
         setTranscript(
           "To mitigate cascading latency, we instrumented distributed tracing and discovered connection pool exhaustion. We added rate-limiting middleware, isolated query paths, and increased Atlas read-replicas, restoring p99 to under 120ms."
@@ -229,7 +288,7 @@ export default function InterviewRoomPage() {
     [clearActiveTimers]
   );
 
-  // 2. Start Live Recording Window (from Prep countdown completion or Skip Prep click)
+  // 2. Start Live Recording Window
   const startRecordingTimer = useCallback(() => {
     clearActiveTimers();
     setGauntletState("RECORDING");
@@ -286,26 +345,20 @@ export default function InterviewRoomPage() {
     const totalQ = questionsRef.current.length;
 
     if (stageIdx + 1 < totalQ) {
-      // Advance to next question prep
       startPrepTimer(stageIdx + 1);
     } else {
-      // Completed all 3 questions! Submit immediately
       handleImmediateFinishAndAnalyze(recorded);
     }
   }, [recordCurrentStageSnapshot, startPrepTimer]);
 
   // 3. IMMEDIATE FINISH INTERVIEW HANDLER
-  // Immediately stops recording, halts timers, shuts off camera tracks,
-  // shows loading screen, and analyzes session!
   const handleImmediateFinishAndAnalyze = async (stagesSnapshot?: StageScorecardItem[]) => {
-    // 1. Immediately stop all timers and cameras
     clearActiveTimers();
     stopMediaDevices();
     setIsAnalyzing(true);
     setGauntletState("COMPLETE");
     gauntletStateRef.current = "COMPLETE";
 
-    // 2. Ensure current stage is recorded
     const finalStages = stagesSnapshot || recordCurrentStageSnapshot();
     const stageIdx = currentQuestionIndexRef.current;
     const activeQuestion = questionsRef.current[stageIdx] || questionsRef.current[0];
@@ -357,7 +410,6 @@ export default function InterviewRoomPage() {
       }
     } catch (err) {
       console.error("Session analysis error:", err);
-      // Fallback display
       setShowScorecard(true);
     } finally {
       setIsAnalyzing(false);
@@ -468,7 +520,7 @@ export default function InterviewRoomPage() {
             ) : (
               <>
                 <Camera className="w-4 h-4 text-cyber-cyan" />
-                Enable Camera
+                Enable Camera &amp; Mic
               </>
             )}
           </button>
@@ -520,7 +572,7 @@ export default function InterviewRoomPage() {
 
       {/* Main Studio Viewport */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 flex-1">
-        {/* Left Column: Video HUD & Pupil Reticle */}
+        {/* Left Column: Video HUD & Live Face / Audio Reticle */}
         <div className="lg:col-span-7 flex flex-col space-y-4">
           <div className="relative aspect-video w-full rounded-2xl bg-slate-950 border border-surface-border overflow-hidden flex items-center justify-center shadow-2xl">
             {/* Live Camera Video */}
@@ -547,12 +599,19 @@ export default function InterviewRoomPage() {
                   onClick={toggleCamera}
                   className="px-4 py-1.5 rounded-lg bg-surface-secondary border border-surface-border text-xs text-cyber-cyan hover:underline cursor-pointer"
                 >
-                  Click to turn on live webcam
+                  Click to turn on live webcam &amp; mic
                 </button>
               </div>
             )}
 
-            {/* Gaze Lock Pill */}
+            {/* Live Speaking / Mouth Movement Visual Box */}
+            {isSpeaking && (
+              <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
+                <div className="w-56 h-64 rounded-3xl border-2 border-cyan-400/60 shadow-[0_0_35px_rgba(6,182,212,0.35)] animate-pulse" />
+              </div>
+            )}
+
+            {/* Top Left: Gaze Lock Pill */}
             <div className="absolute top-4 left-4 z-10 flex items-center gap-2">
               <div
                 className={`px-3 py-1 rounded-full text-xs font-mono font-medium flex items-center gap-1.5 backdrop-blur-md border ${
@@ -563,6 +622,35 @@ export default function InterviewRoomPage() {
               >
                 <Eye className="w-3.5 h-3.5" />
                 {gazeLocked ? "GAZE LOCKED ON CAMERA" : "GAZE DRIFT DETECTED"}
+              </div>
+            </div>
+
+            {/* Top Right: Live Audio / Mouth Activity & Animated Equalizer */}
+            <div className="absolute top-4 right-4 z-10 flex items-center gap-2">
+              <div
+                className={`px-3 py-1 rounded-full text-xs font-mono font-medium flex items-center gap-2 backdrop-blur-md border transition-all ${
+                  isSpeaking
+                    ? "bg-emerald-500/25 text-emerald-300 border-emerald-500/50 shadow-sm"
+                    : "bg-slate-900/80 text-slate-400 border-slate-700/60"
+                }`}
+              >
+                <Mic className={`w-3.5 h-3.5 ${isSpeaking ? "text-emerald-400 animate-pulse" : "text-slate-500"}`} />
+                <span>{isSpeaking ? "AUDIO ACTIVE: SPEAKING" : "LISTENING..."}</span>
+
+                {/* Animated EQ Bars */}
+                <div className="flex items-end gap-0.5 h-3.5 ml-1">
+                  {[0.4, 0.8, 1.0, 0.7, 0.5].map((multiplier, i) => (
+                    <div
+                      key={i}
+                      className={`w-1 rounded-full transition-all duration-75 ${
+                        isSpeaking ? "bg-cyber-cyan shadow-[0_0_6px_#06b6d4]" : "bg-slate-700"
+                      }`}
+                      style={{
+                        height: isSpeaking ? `${Math.max(25, Math.min(100, audioVolume * 100 * multiplier))}%` : "20%",
+                      }}
+                    />
+                  ))}
+                </div>
               </div>
             </div>
 
