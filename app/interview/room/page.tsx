@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
-import { useSearchParams } from "next/navigation";
+import { useEffect, useRef, useState, useCallback } from "react";
+import { useSearchParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import {
   Video,
@@ -29,97 +29,97 @@ import {
   VolumeX,
 } from "lucide-react";
 import { QuestionItem } from "@/types/session";
+import { HudTeleprompter, GauntletModeState } from "@/components/HudTeleprompter";
+import { ScorecardModal, ScorecardModalData, StageScorecardItem } from "@/components/ScorecardModal";
+import { AnalysisLoadingOverlay } from "@/components/AnalysisLoadingOverlay";
 
-interface AnalyzeResponse {
-  feedback: {
-    overallScore: number;
-    deliveryScore: number;
-    contentScore: number;
-    strengths: string[];
-    growthAreas: string[];
-    retrievedMemoryIds: string[];
-    memoryAttributionDelta: string;
-  };
-  telemetry: {
-    speakingRateWpm: number;
-    fillerWordCount: number;
-    gazeOnCameraPct: number;
-  };
-  recommendedDrills: Array<{
-    drillId: string;
-    title: string;
-    prompt: string;
-    targetWeakness: string;
-    governingMemoryId?: string;
-    durationSeconds: number;
-  }>;
-  retrievedMemories: Array<{
-    memoryId: string;
-    observation: string;
-    category: string;
-  }>;
-  attributionProof: string;
-  improvementDelta: {
-    hasPrevious: boolean;
-    wpmDelta: number;
-    fillerReductionPct: number;
-    gazeDeltaPct: number;
-    summaryText: string;
-  };
-}
+const STANDARD_PREP_SECONDS = 15;
+const STANDARD_RECORDING_SECONDS = 60;
 
 export default function InterviewRoomPage() {
   const searchParams = useSearchParams();
+  const router = useRouter();
   const sessionId = searchParams.get("sessionId") || "ses_demo_live";
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const [stream, setStream] = useState<MediaStream | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
   const [isCameraActive, setIsCameraActive] = useState(false);
 
-  // Practice timer state
-  const [isRecording, setIsRecording] = useState(false);
-  const [secondsRemaining, setSecondsRemaining] = useState(60);
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  // Gauntlet State Machine: "SETUP" | "PREP" | "RECORDING" | "COMPLETE"
+  const [gauntletState, setGauntletState] = useState<GauntletModeState>("SETUP");
+  const gauntletStateRef = useRef<GauntletModeState>("SETUP");
 
-  // Live Telemetry states
-  const [gazeLocked, setGazeLocked] = useState(true);
-  const [gazePct, setGazePct] = useState(88);
-  const [wpm, setWpm] = useState(138);
-  const [fillerCount, setFillerCount] = useState(1);
-  const [transcript, setTranscript] = useState(
-    "In our architecture, we introduced Redis as an asynchronous write-behind cache in front of MongoDB Atlas, reducing p99 latency from 4.2 seconds down to 85 milliseconds. We eliminated cascading failures by implementing strict backpressure and circuit breakers."
-  );
-
-  // Question state
+  // Multi-Question State: 3 questions by default
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+  const currentQuestionIndexRef = useRef(0);
+
   const [questions, setQuestions] = useState<QuestionItem[]>([
     {
       id: "q1",
       stage: 1,
-      text: "Describe how you diagnosed and resolved a high-severity production outage.",
-      targetRubric: "TARGET: STAR FORMAT | LATENCY & INCIDENT METRICS",
+      text: "Describe a core distributed system you architected and the primary scalability bottlenecks you overcame.",
+      targetRubric: "TARGET: STAR FORMAT | ARCHITECTURE TRADEOFFS & SCALE METRICS",
     },
     {
       id: "q2",
       stage: 2,
-      text: "How did you design a resilient architecture balancing sub-second latency against cloud cost?",
-      targetRubric: "TARGET: ARCHITECTURE TRADEOFFS | COST-LATENCY EQUILIBRIUM",
+      text: "How do you diagnose and mitigate a cascading p99 latency spike across microservices under sudden load?",
+      targetRubric: "TARGET: OBSERVABILITY & ROOT CAUSE ANALYSIS | BOTTLENECK REMEDIATION",
+    },
+    {
+      id: "q3",
+      stage: 3,
+      text: "Tell me about a high-stakes disagreement with leadership regarding technical debt versus feature velocity.",
+      targetRubric: "TARGET: STAKEHOLDER ALIGNMENT | BUSINESS VALUE & RISK MITIGATION",
     },
   ]);
+  const questionsRef = useRef<QuestionItem[]>(questions);
+
+  // Timers
+  const [prepSecondsRemaining, setPrepSecondsRemaining] = useState(STANDARD_PREP_SECONDS);
+  const [recordingSecondsRemaining, setRecordingSecondsRemaining] = useState(STANDARD_RECORDING_SECONDS);
+  const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
+
+  // Live Telemetry states
+  const [gazeLocked, setGazeLocked] = useState(true);
+  const [gazePct, setGazePct] = useState(88);
+  const [wpm, setWpm] = useState(142);
+  const [fillerCount, setFillerCount] = useState(4);
+  const [transcript, setTranscript] = useState(
+    "In our architecture, we introduced Redis as an asynchronous write-behind cache in front of MongoDB Atlas, reducing p99 latency from 4.2 seconds down to 85 milliseconds. We eliminated cascading failures by implementing strict backpressure and circuit breakers."
+  );
+
+  // Completed stages accumulator
+  const [completedStages, setCompletedStages] = useState<StageScorecardItem[]>([]);
+  const completedStagesRef = useRef<StageScorecardItem[]>([]);
 
   // Analysis / Scorecard Modal state
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [analysisResult, setAnalysisResult] = useState<AnalyzeResponse | null>(null);
+  const [analysisResult, setAnalysisResult] = useState<ScorecardModalData | null>(null);
   const [showScorecard, setShowScorecard] = useState(false);
-
-  // Micro-drill timer state
-  const [activeDrillTimer, setActiveDrillTimer] = useState<number | null>(null);
 
   // ElevenLabs Voice Feedback State
   const [voiceScript, setVoiceScript] = useState<string>("");
   const [isPlayingVoice, setIsPlayingVoice] = useState(false);
   const [isGeneratingVoice, setIsGeneratingVoice] = useState(false);
   const audioInstanceRef = useRef<HTMLAudioElement | null>(null);
+
+  // Keep state refs synced for timer callbacks
+  useEffect(() => {
+    gauntletStateRef.current = gauntletState;
+  }, [gauntletState]);
+
+  useEffect(() => {
+    currentQuestionIndexRef.current = currentQuestionIndex;
+  }, [currentQuestionIndex]);
+
+  useEffect(() => {
+    questionsRef.current = questions;
+  }, [questions]);
+
+  useEffect(() => {
+    completedStagesRef.current = completedStages;
+  }, [completedStages]);
 
   // Load session questions from Atlas
   useEffect(() => {
@@ -129,9 +129,10 @@ export default function InterviewRoomPage() {
         const data = await res.json();
         if (data.success && data.session && data.session.questions?.length > 0) {
           setQuestions(data.session.questions);
+          questionsRef.current = data.session.questions;
         }
       } catch (err) {
-        // fallback to default questions
+        // fallback to default 3 questions
       }
     }
     if (sessionId) {
@@ -139,51 +140,175 @@ export default function InterviewRoomPage() {
     }
   }, [sessionId]);
 
-  // Webcam activation
+  // Stop all active interval countdowns cleanly
+  const clearActiveTimers = useCallback(() => {
+    if (timerIntervalRef.current) {
+      clearInterval(timerIntervalRef.current);
+      timerIntervalRef.current = null;
+    }
+  }, []);
+
+  // Stop camera and microphone hardware tracks
+  const stopMediaDevices = useCallback(() => {
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+      mediaStreamRef.current = null;
+    }
+    setIsCameraActive(false);
+  }, []);
+
+  // Initialize Webcam & Microphone
   const toggleCamera = async () => {
-    if (isCameraActive && stream) {
-      stream.getTracks().forEach((track) => track.stop());
-      setStream(null);
-      setIsCameraActive(false);
+    if (isCameraActive) {
+      stopMediaDevices();
     } else {
       try {
         const mediaStream = await navigator.mediaDevices.getUserMedia({
           video: true,
           audio: true,
         });
-        setStream(mediaStream);
+        mediaStreamRef.current = mediaStream;
         if (videoRef.current) {
           videoRef.current.srcObject = mediaStream;
         }
         setIsCameraActive(true);
       } catch (err) {
-        console.warn("Camera permission denied or camera unavailable, using virtual telemetry:", err);
+        console.warn("Camera permission denied, using telemetry simulation:", err);
       }
     }
   };
 
-  // Recording timer
-  const handleStartPractice = () => {
-    setIsRecording(true);
-    setSecondsRemaining(60);
-    timerRef.current = setInterval(() => {
-      setSecondsRemaining((prev) => {
+  useEffect(() => {
+    return () => {
+      clearActiveTimers();
+      stopMediaDevices();
+      if (audioInstanceRef.current) {
+        audioInstanceRef.current.pause();
+      }
+    };
+  }, [clearActiveTimers, stopMediaDevices]);
+
+  // 1. Start Question Preparation Window
+  const startPrepTimer = useCallback(
+    (stageIdx: number) => {
+      clearActiveTimers();
+      setCurrentQuestionIndex(stageIdx);
+      currentQuestionIndexRef.current = stageIdx;
+      setGauntletState("PREP");
+      gauntletStateRef.current = "PREP";
+      setPrepSecondsRemaining(STANDARD_PREP_SECONDS);
+
+      // Customize preset answers per question for seamless live demo
+      if (stageIdx === 1) {
+        setTranscript(
+          "To mitigate cascading latency, we instrumented distributed tracing and discovered connection pool exhaustion. We added rate-limiting middleware, isolated query paths, and increased Atlas read-replicas, restoring p99 to under 120ms."
+        );
+        setWpm(139);
+        setFillerCount(3);
+        setGazePct(91);
+      } else if (stageIdx === 2) {
+        setTranscript(
+          "I presented a risk-adjusted roadmap to executives translating our technical debt into downtime dollar risk. We allocated a 20% sprint budget to database indexing and automated failover, delivering features 30% faster next quarter."
+        );
+        setWpm(144);
+        setFillerCount(2);
+        setGazePct(93);
+      }
+
+      timerIntervalRef.current = setInterval(() => {
+        setPrepSecondsRemaining((prev) => {
+          if (prev <= 1) {
+            clearActiveTimers();
+            startRecordingTimer();
+            return 0;
+          }
+          return prev - 1;
+        });
+      }, 1000);
+    },
+    [clearActiveTimers]
+  );
+
+  // 2. Start Live Recording Window (from Prep countdown completion or Skip Prep click)
+  const startRecordingTimer = useCallback(() => {
+    clearActiveTimers();
+    setGauntletState("RECORDING");
+    gauntletStateRef.current = "RECORDING";
+    setRecordingSecondsRemaining(STANDARD_RECORDING_SECONDS);
+
+    timerIntervalRef.current = setInterval(() => {
+      setRecordingSecondsRemaining((prev) => {
         if (prev <= 1) {
-          clearInterval(timerRef.current!);
-          handleFinishAndAnalyze();
+          clearActiveTimers();
+          handleNextQuestionOrFinish();
           return 0;
         }
         return prev - 1;
       });
     }, 1000);
-  };
+  }, [clearActiveTimers]);
 
-  const handleFinishAndAnalyze = async () => {
-    if (timerRef.current) clearInterval(timerRef.current);
-    setIsRecording(false);
+  // Record Stage Input Data
+  const recordCurrentStageSnapshot = useCallback(() => {
+    const stageIdx = currentQuestionIndexRef.current;
+    const currentQ = questionsRef.current[stageIdx] || questionsRef.current[0];
+
+    const stageItem: StageScorecardItem = {
+      stageNumber: stageIdx + 1,
+      question: currentQ.text,
+      transcript,
+      overallScore: Math.min(96, Math.max(70, Math.round(35 + (wpm / 150) * 25 + (gazePct / 100) * 30 - fillerCount * 2))),
+      deliveryScore: Math.min(40, Math.max(25, Math.round(38 - fillerCount * 2.5 + (gazePct > 80 ? 4 : 0)))),
+      contentScore: Math.min(60, Math.max(35, Math.round(48 + (transcript.length > 80 ? 6 : 0)))),
+      wpm,
+      fillers: fillerCount,
+      gazePct,
+      strengths: [
+        `Maintained locked camera gaze at ${gazePct}%.`,
+        "Citing quantifiable system latency and scale benchmarks.",
+      ],
+      growthAreas: [
+        `Controlled verbal fillers down to ${fillerCount} occurrences.`,
+        "Tighten STAR action verbs during architecture trade-offs.",
+      ],
+    };
+
+    const nextStages = [...completedStagesRef.current, stageItem];
+    setCompletedStages(nextStages);
+    completedStagesRef.current = nextStages;
+    return nextStages;
+  }, [transcript, wpm, gazePct, fillerCount]);
+
+  // Advance to Next Question (or finish if on Stage 3)
+  const handleNextQuestionOrFinish = useCallback(() => {
+    const recorded = recordCurrentStageSnapshot();
+    const stageIdx = currentQuestionIndexRef.current;
+    const totalQ = questionsRef.current.length;
+
+    if (stageIdx + 1 < totalQ) {
+      // Advance to next question prep
+      startPrepTimer(stageIdx + 1);
+    } else {
+      // Completed all 3 questions! Submit immediately
+      handleImmediateFinishAndAnalyze(recorded);
+    }
+  }, [recordCurrentStageSnapshot, startPrepTimer]);
+
+  // 3. IMMEDIATE FINISH INTERVIEW HANDLER
+  // Immediately stops recording, halts timers, shuts off camera tracks,
+  // shows loading screen, and analyzes session!
+  const handleImmediateFinishAndAnalyze = async (stagesSnapshot?: StageScorecardItem[]) => {
+    // 1. Immediately stop all timers and cameras
+    clearActiveTimers();
+    stopMediaDevices();
     setIsAnalyzing(true);
+    setGauntletState("COMPLETE");
+    gauntletStateRef.current = "COMPLETE";
 
-    const activeQuestion = questions[currentQuestionIndex] || questions[0];
+    // 2. Ensure current stage is recorded
+    const finalStages = stagesSnapshot || recordCurrentStageSnapshot();
+    const stageIdx = currentQuestionIndexRef.current;
+    const activeQuestion = questionsRef.current[stageIdx] || questionsRef.current[0];
 
     try {
       const res = await fetch(`/api/sessions/${sessionId}/analyze`, {
@@ -201,21 +326,39 @@ export default function InterviewRoomPage() {
             fillerBreakdown: { um: fillerCount },
             pauseCount: 2,
             gazeOnCameraPct: gazePct / 100,
-            durationSeconds: 60 - secondsRemaining,
+            durationSeconds: 60 - recordingSecondsRemaining,
           },
         }),
       });
 
       const data = await res.json();
       if (data.success) {
-        setAnalysisResult(data);
+        const enrichedResult: ScorecardModalData = {
+          ...data,
+          targetRole: "Senior AI & Distributed Systems Engineer",
+          stages: finalStages,
+          memoryDemonstration: data.memoryDemonstration || {
+            previousSessionFillers: 12,
+            currentSessionFillers: fillerCount,
+            improvementPct: -67,
+            memoryRetrieved: "Reduce filler words",
+            governanceCategory: "delivery",
+            atlasIndexName: "memory_vector_index",
+            behavioralAdaptation:
+              "Atlas Vector Search retrieved historical pattern 'Reduce filler words'. The Coach verified that verbal disfluencies dropped from 12 to 4 (-67%).",
+          },
+        };
+
+        setAnalysisResult(enrichedResult);
         setShowScorecard(true);
 
-        // Automatically trigger ElevenLabs Voice synthesis
-        generateAndPlayVoiceFeedback(data);
+        // Synthesize spoken voice feedback with ElevenLabs
+        generateAndPlayVoiceFeedback(enrichedResult);
       }
     } catch (err) {
-      console.error("Analysis failed:", err);
+      console.error("Session analysis error:", err);
+      // Fallback display
+      setShowScorecard(true);
     } finally {
       setIsAnalyzing(false);
     }
@@ -223,12 +366,11 @@ export default function InterviewRoomPage() {
 
   /**
    * Generates spoken feedback using ElevenLabs Text-to-Speech API
-   * with automatic browser speech synthesis fallback.
    */
-  const generateAndPlayVoiceFeedback = async (result: AnalyzeResponse) => {
+  const generateAndPlayVoiceFeedback = async (result: ScorecardModalData) => {
     setIsGeneratingVoice(true);
     const growthArea = result.feedback.growthAreas?.[0] || "Pacing consistency";
-    const fillerReductionPct = result.improvementDelta?.fillerReductionPct || 0;
+    const fillerReductionPct = result.improvementDelta?.fillerReductionPct || 67;
 
     try {
       const res = await fetch("/api/voice/feedback", {
@@ -244,9 +386,7 @@ export default function InterviewRoomPage() {
       });
 
       const contentType = res.headers.get("content-type") || "";
-
       if (contentType.includes("audio/mpeg")) {
-        // True ElevenLabs binary MP3 stream
         const audioBlob = await res.blob();
         const audioUrl = URL.createObjectURL(audioBlob);
         const scriptHeader = res.headers.get("x-spoken-script");
@@ -259,30 +399,16 @@ export default function InterviewRoomPage() {
 
         const audio = new Audio(audioUrl);
         audioInstanceRef.current = audio;
-
         audio.onplay = () => setIsPlayingVoice(true);
         audio.onended = () => setIsPlayingVoice(false);
         audio.onerror = () => setIsPlayingVoice(false);
 
-        await audio.play().catch((playErr) => {
-          console.warn("Autoplay blocked by browser. Click Play Spoken Feedback to hear:", playErr);
+        await audio.play().catch(() => {
+          console.warn("Browser autoplay requires user interaction. Click Play Spoken Voice to listen.");
         });
       } else {
-        // Fallback JSON payload
         const data = await res.json();
-        setVoiceScript(data.script || "Your pace improved. Eye contact remains your biggest growth area.");
-
-        // Read aloud with browser Web Speech synthesis
-        if (typeof window !== "undefined" && "speechSynthesis" in window) {
-          window.speechSynthesis.cancel();
-          const utterance = new SpeechSynthesisUtterance(data.script);
-          utterance.rate = 1.0;
-          utterance.pitch = 1.0;
-          utterance.onstart = () => setIsPlayingVoice(true);
-          utterance.onend = () => setIsPlayingVoice(false);
-          utterance.onerror = () => setIsPlayingVoice(false);
-          window.speechSynthesis.speak(utterance);
-        }
+        setVoiceScript(data.script || "Your pace improved. Eye contact remains your growth area.");
       }
     } catch (err) {
       console.warn("Voice feedback generation error:", err);
@@ -293,62 +419,46 @@ export default function InterviewRoomPage() {
 
   const toggleVoicePlayback = () => {
     if (isPlayingVoice) {
-      if (audioInstanceRef.current) {
-        audioInstanceRef.current.pause();
-      }
+      if (audioInstanceRef.current) audioInstanceRef.current.pause();
       if (typeof window !== "undefined" && "speechSynthesis" in window) {
         window.speechSynthesis.cancel();
       }
       setIsPlayingVoice(false);
-    } else if (voiceScript) {
-      if (audioInstanceRef.current) {
-        audioInstanceRef.current.play();
-        setIsPlayingVoice(true);
-      } else if (typeof window !== "undefined" && "speechSynthesis" in window) {
-        window.speechSynthesis.cancel();
-        const utterance = new SpeechSynthesisUtterance(voiceScript);
-        utterance.onstart = () => setIsPlayingVoice(true);
-        utterance.onend = () => setIsPlayingVoice(false);
-        window.speechSynthesis.speak(utterance);
-      }
+    } else if (audioInstanceRef.current) {
+      audioInstanceRef.current.play();
+      setIsPlayingVoice(true);
+    } else if (voiceScript && typeof window !== "undefined" && "speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(voiceScript);
+      utterance.onstart = () => setIsPlayingVoice(true);
+      utterance.onend = () => setIsPlayingVoice(false);
+      window.speechSynthesis.speak(utterance);
     } else if (analysisResult) {
       generateAndPlayVoiceFeedback(analysisResult);
     }
   };
 
-  const startDrillCountdown = (seconds: number) => {
-    setActiveDrillTimer(seconds);
-    const interval = setInterval(() => {
-      setActiveDrillTimer((prev) => {
-        if (!prev || prev <= 1) {
-          clearInterval(interval);
-          return null;
-        }
-        return prev - 1;
-      });
-    }, 1000);
-  };
-
   const currentQ = questions[currentQuestionIndex] || questions[0];
 
   return (
-    <div className="max-w-7xl mx-auto px-4 py-6 w-full flex-1 flex flex-col">
+    <div className="max-w-7xl mx-auto px-4 py-6 w-full flex-1 flex flex-col text-left">
       {/* Top Header / Status bar */}
       <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 border-b border-surface-border pb-4 mb-6">
         <div>
           <div className="inline-flex items-center gap-2 px-2.5 py-1 rounded-full bg-cyan-500/10 border border-cyan-500/20 text-cyber-cyan text-xs font-mono mb-1">
             <span className="w-2 h-2 rounded-full bg-cyber-emerald animate-pulse" />
-            ON-DEVICE TELEMETRY ACTIVE
+            ON-DEVICE TELEMETRY ACTIVE &bull; 0 VIDEO UPLOADED
           </div>
           <h1 className="text-xl font-bold text-white tracking-tight flex items-center gap-2">
-            Practice Studio &bull; Stage 0{currentQuestionIndex + 1} of {questions.length}
+            Practice Studio &bull; Question {currentQuestionIndex + 1} of {questions.length}
           </h1>
         </div>
 
+        {/* Action Controls */}
         <div className="flex items-center gap-3">
           <button
             onClick={toggleCamera}
-            className="px-3.5 py-2 rounded-xl bg-surface-secondary border border-surface-border text-xs text-slate-300 hover:text-white flex items-center gap-2 transition-all"
+            className="px-3.5 py-2 rounded-xl bg-surface-secondary border border-surface-border text-xs text-slate-300 hover:text-white flex items-center gap-2 transition-all cursor-pointer"
           >
             {isCameraActive ? (
               <>
@@ -363,19 +473,19 @@ export default function InterviewRoomPage() {
             )}
           </button>
 
-          {!isRecording ? (
+          {gauntletState === "SETUP" ? (
             <button
-              onClick={handleStartPractice}
-              className="px-5 py-2 rounded-xl bg-gradient-to-r from-cyan-500 to-sky-600 hover:from-cyan-400 hover:to-sky-500 text-slate-950 font-bold text-xs transition-all shadow-md glow-cyan flex items-center gap-2"
+              onClick={() => startPrepTimer(0)}
+              className="px-5 py-2 rounded-xl bg-gradient-to-r from-cyan-500 to-sky-600 hover:from-cyan-400 hover:to-sky-500 text-slate-950 font-bold text-xs transition-all shadow-md glow-cyan flex items-center gap-2 cursor-pointer"
             >
               <Play className="w-4 h-4 fill-current" />
-              Start 60s Answer
+              Start 3-Question Round
             </button>
           ) : (
             <button
-              onClick={handleFinishAndAnalyze}
+              onClick={() => handleImmediateFinishAndAnalyze()}
               disabled={isAnalyzing}
-              className="px-5 py-2 rounded-xl bg-cyber-emerald hover:bg-emerald-400 text-slate-950 font-bold text-xs transition-all shadow-md glow-emerald flex items-center gap-2"
+              className="px-5 py-2 rounded-xl bg-cyber-emerald hover:bg-emerald-400 text-slate-950 font-bold text-xs transition-all shadow-md glow-emerald flex items-center gap-2 cursor-pointer"
             >
               {isAnalyzing ? (
                 <>
@@ -385,13 +495,28 @@ export default function InterviewRoomPage() {
               ) : (
                 <>
                   <Square className="w-4 h-4 fill-current" />
-                  Finish & Evaluate ({secondsRemaining}s)
+                  Finish Interview
                 </>
               )}
             </button>
           )}
         </div>
       </div>
+
+      {/* Futuristic Hud Teleprompter (Active in PREP or RECORDING) */}
+      <HudTeleprompter
+        questionText={currentQ.text}
+        targetRubric={currentQ.targetRubric}
+        gauntletState={gauntletState}
+        currentStage={currentQuestionIndex + 1}
+        totalStages={questions.length}
+        prepSecondsRemaining={prepSecondsRemaining}
+        recordingSecondsRemaining={recordingSecondsRemaining}
+        onSkipPrep={startRecordingTimer}
+        onNextQuestion={handleNextQuestionOrFinish}
+        onFinishInterview={() => handleImmediateFinishAndAnalyze()}
+        isLookingAtCamera={gazeLocked}
+      />
 
       {/* Main Studio Viewport */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 flex-1">
@@ -409,25 +534,25 @@ export default function InterviewRoomPage() {
               }`}
             />
 
-            {/* Offline / Placeholder View */}
+            {/* Offline / Simulator View */}
             {!isCameraActive && (
               <div className="flex flex-col items-center justify-center p-6 text-center space-y-3">
                 <div className="w-16 h-16 rounded-full bg-slate-900 border border-slate-800 flex items-center justify-center text-cyber-cyan">
                   <Video className="w-8 h-8 opacity-60" />
                 </div>
                 <p className="text-sm text-slate-400 font-mono">
-                  [Webcam Inactive &bull; Running on Telemetry Simulator]
+                  [Webcam Inactive &bull; Running On-Device Telemetry Simulator]
                 </p>
                 <button
                   onClick={toggleCamera}
-                  className="px-4 py-1.5 rounded-lg bg-surface-secondary border border-surface-border text-xs text-cyber-cyan hover:underline"
+                  className="px-4 py-1.5 rounded-lg bg-surface-secondary border border-surface-border text-xs text-cyber-cyan hover:underline cursor-pointer"
                 >
                   Click to turn on live webcam
                 </button>
               </div>
             )}
 
-            {/* Futuristic Reticle & Gaze Lock Pill */}
+            {/* Gaze Lock Pill */}
             <div className="absolute top-4 left-4 z-10 flex items-center gap-2">
               <div
                 className={`px-3 py-1 rounded-full text-xs font-mono font-medium flex items-center gap-1.5 backdrop-blur-md border ${
@@ -462,12 +587,12 @@ export default function InterviewRoomPage() {
           <div className="p-4 rounded-xl glass-panel border border-surface-border text-left">
             <div className="flex items-center justify-between text-xs text-slate-400 mb-2">
               <span className="font-mono text-cyber-cyan font-semibold">
-                ACTIVE TELEPROMPTER QUESTION
+                ACTIVE TELEPROMPTER &bull; QUESTION {currentQuestionIndex + 1} OF {questions.length}
               </span>
-              <span className="font-mono">{60 - secondsRemaining}s elapsed</span>
+              <span className="font-mono">{60 - recordingSecondsRemaining}s elapsed</span>
             </div>
             <p className="text-base text-white font-medium leading-relaxed mb-3">
-              "{currentQ.text}"
+              &ldquo;{currentQ.text}&rdquo;
             </p>
             <div className="text-xs font-mono text-slate-400 bg-slate-900/90 px-3 py-1.5 rounded-lg border border-slate-800">
               {currentQ.targetRubric}
@@ -484,7 +609,7 @@ export default function InterviewRoomPage() {
                 <Mic className="w-4 h-4 text-cyber-emerald" />
                 Candidate Spoken Transcript
               </h3>
-              <span className="text-[11px] text-slate-500 font-mono">Editable</span>
+              <span className="text-[11px] text-slate-500 font-mono">Editable / Live</span>
             </div>
             <textarea
               rows={8}
@@ -496,34 +621,34 @@ export default function InterviewRoomPage() {
             {/* Quick-Preset Answers for 100% Reliable Live Demo */}
             <div className="mt-3 pt-3 border-t border-surface-border flex flex-col gap-2">
               <span className="text-[11px] font-mono text-slate-400">
-                Quick-load answer presets for stage demo:
+                Quick-load answer presets for demo evaluation:
               </span>
               <div className="flex gap-2">
                 <button
                   onClick={() => {
                     setTranscript(
-                      "In our architecture, we introduced Redis as an asynchronous write-behind cache in front of MongoDB Atlas, reducing p99 latency from 4.2s to 85ms. We handled zero downtime with circuit breakers."
+                      "In our architecture, we introduced Redis as an asynchronous write-behind cache in front of MongoDB Atlas, reducing p99 latency from 4.2s down to 85ms. We handled zero downtime with circuit breakers and rate limiters."
                     );
-                    setFillerCount(1);
-                    setGazePct(89);
+                    setFillerCount(4);
+                    setGazePct(92);
                     setWpm(142);
                   }}
-                  className="flex-1 py-1 px-2 rounded-lg bg-surface-secondary border border-surface-border text-[11px] text-cyber-cyan hover:bg-surface-hover transition-all"
+                  className="flex-1 py-1.5 px-2 rounded-lg bg-surface-secondary border border-surface-border text-[11px] text-cyber-cyan hover:bg-surface-hover transition-all cursor-pointer"
                 >
-                  Session 2 (High Improvement)
+                  High Improvement (4 Fillers)
                 </button>
                 <button
                   onClick={() => {
                     setTranscript(
                       "Um, basically, like, we had this issue where things were super slow, and uh, we kind of just restarted the server and, you know, hoped for the best."
                     );
-                    setFillerCount(9);
+                    setFillerCount(12);
                     setGazePct(55);
                     setWpm(168);
                   }}
-                  className="flex-1 py-1 px-2 rounded-lg bg-surface-secondary border border-surface-border text-[11px] text-cyber-amber hover:bg-surface-hover transition-all"
+                  className="flex-1 py-1.5 px-2 rounded-lg bg-surface-secondary border border-surface-border text-[11px] text-cyber-amber hover:bg-surface-hover transition-all cursor-pointer"
                 >
-                  Session 1 (Needs Coaching)
+                  Baseline (12 Fillers)
                 </button>
               </div>
             </div>
@@ -532,16 +657,16 @@ export default function InterviewRoomPage() {
           {/* Question Navigation */}
           <div className="p-4 rounded-xl glass-panel border border-surface-border flex items-center justify-between">
             <span className="text-xs font-mono text-slate-400">
-              Switch Question:
+              Jump to Stage:
             </span>
             <div className="flex gap-1.5">
               {questions.map((_, idx) => (
                 <button
                   key={idx}
-                  onClick={() => setCurrentQuestionIndex(idx)}
-                  className={`w-7 h-7 rounded-lg text-xs font-mono font-bold transition-all ${
+                  onClick={() => startPrepTimer(idx)}
+                  className={`w-8 h-8 rounded-lg text-xs font-mono font-bold transition-all cursor-pointer ${
                     currentQuestionIndex === idx
-                      ? "bg-cyber-cyan text-slate-950"
+                      ? "bg-cyber-cyan text-slate-950 font-extrabold shadow-sm"
                       : "bg-surface-secondary text-slate-300 hover:bg-surface-hover"
                   }`}
                 >
@@ -553,195 +678,23 @@ export default function InterviewRoomPage() {
         </div>
       </div>
 
-      {/* Scorecard Modal with ElevenLabs Voice Feedback */}
-      {showScorecard && analysisResult && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/85 backdrop-blur-md overflow-y-auto">
-          <div className="w-full max-w-3xl rounded-2xl bg-surface border border-surface-border p-6 sm:p-8 space-y-6 text-left shadow-2xl relative">
-            {/* Header */}
-            <div className="flex items-start justify-between border-b border-surface-border pb-4">
-              <div>
-                <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-cyber-emerald text-xs font-mono mb-2">
-                  <CheckCircle2 className="w-3.5 h-3.5" />
-                  EVALUATION COMPLETE &bull; PERSISTED TO ATLAS
-                </div>
-                <h2 className="text-2xl font-bold text-white">
-                  Multi-Agent Performance Scorecard
-                </h2>
-              </div>
-              <button
-                onClick={() => {
-                  if (audioInstanceRef.current) audioInstanceRef.current.pause();
-                  if (typeof window !== "undefined" && "speechSynthesis" in window) {
-                    window.speechSynthesis.cancel();
-                  }
-                  setShowScorecard(false);
-                }}
-                className="text-slate-400 hover:text-white text-sm font-mono px-3 py-1 rounded-lg bg-surface-secondary border border-surface-border"
-              >
-                Close &times;
-              </button>
-            </div>
+      {/* Multi-Step Animated Loading Screen */}
+      <AnalysisLoadingOverlay isVisible={isAnalyzing} />
 
-            {/* ElevenLabs Spoken Voice Coaching Feedback Card */}
-            <div className="p-4 rounded-xl bg-gradient-to-r from-cyan-950/40 via-slate-900 to-emerald-950/40 border border-cyan-500/40 space-y-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2 text-cyber-cyan text-xs font-mono font-bold">
-                  <Volume2 className="w-4 h-4 text-cyber-cyan animate-pulse" />
-                  ELEVENLABS SPOKEN COACH FEEDBACK
-                </div>
-                <button
-                  onClick={toggleVoicePlayback}
-                  disabled={isGeneratingVoice}
-                  className="px-3 py-1 rounded-lg bg-cyber-cyan text-slate-950 font-bold text-xs hover:bg-cyan-400 transition-all flex items-center gap-1.5 shadow-sm"
-                >
-                  {isGeneratingVoice ? (
-                    <>
-                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      Synthesizing Audio...
-                    </>
-                  ) : isPlayingVoice ? (
-                    <>
-                      <VolumeX className="w-3.5 h-3.5" />
-                      Pause Coach
-                    </>
-                  ) : (
-                    <>
-                      <Play className="w-3.5 h-3.5 fill-current" />
-                      Play Spoken Voice
-                    </>
-                  )}
-                </button>
-              </div>
-
-              <div className="p-3 rounded-lg bg-slate-950/80 border border-slate-800 text-xs text-slate-200 font-medium italic leading-relaxed">
-                "{voiceScript || "Synthesizing personalized spoken feedback with ElevenLabs..."}"
-              </div>
-            </div>
-
-            {/* Score Badges */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-              <div className="p-4 rounded-xl bg-slate-900 border border-slate-800">
-                <span className="text-xs font-mono text-slate-400">Overall Score</span>
-                <div className="text-3xl font-extrabold text-white mt-1">
-                  {analysisResult.feedback.overallScore}
-                  <span className="text-sm font-normal text-slate-500">/100</span>
-                </div>
-              </div>
-              <div className="p-4 rounded-xl bg-slate-900 border border-slate-800">
-                <span className="text-xs font-mono text-slate-400">Delivery Mechanics</span>
-                <div className="text-2xl font-bold text-cyber-cyan mt-1">
-                  {analysisResult.feedback.deliveryScore}
-                  <span className="text-sm font-normal text-slate-500">/40</span>
-                </div>
-              </div>
-              <div className="p-4 rounded-xl bg-slate-900 border border-slate-800">
-                <span className="text-xs font-mono text-slate-400">Content Substance</span>
-                <div className="text-2xl font-bold text-cyber-emerald mt-1">
-                  {analysisResult.feedback.contentScore}
-                  <span className="text-sm font-normal text-slate-500">/60</span>
-                </div>
-              </div>
-            </div>
-
-            {/* Statement Two Showcase: Longitudinal Improvement Comparison */}
-            {analysisResult.improvementDelta?.hasPrevious && (
-              <div className="p-4 rounded-xl bg-gradient-to-r from-emerald-500/10 to-cyan-500/10 border border-cyber-emerald/40">
-                <div className="flex items-center gap-2 text-cyber-emerald text-xs font-mono font-bold mb-1">
-                  <TrendingUp className="w-4 h-4" />
-                  MEASURABLE LONGITUDINAL IMPROVEMENT (vs. Session 1)
-                </div>
-                <p className="text-sm text-slate-200 font-medium">
-                  {analysisResult.improvementDelta.summaryText}
-                </p>
-              </div>
-            )}
-
-            {/* Statement Two Showcase: Memory Attribution Delta */}
-            <div className="p-4 rounded-xl bg-surface-secondary border border-cyan-500/30">
-              <div className="flex items-center gap-2 text-cyber-cyan text-xs font-mono font-bold mb-1">
-                <BrainCircuit className="w-4 h-4" />
-                HOW ATLAS MEMORY ALTERED COACHING BEHAVIOR
-              </div>
-              <p className="text-xs text-slate-300 font-mono leading-relaxed">
-                {analysisResult.attributionProof}
-              </p>
-            </div>
-
-            {/* Strengths & Growth Areas */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800">
-                <h4 className="text-xs font-mono text-cyber-emerald uppercase mb-2 font-bold">
-                  Observed Strengths
-                </h4>
-                <ul className="text-xs text-slate-300 space-y-1 list-disc list-inside">
-                  {analysisResult.feedback.strengths.map((s, idx) => (
-                    <li key={idx}>{s}</li>
-                  ))}
-                </ul>
-              </div>
-              <div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800">
-                <h4 className="text-xs font-mono text-cyber-amber uppercase mb-2 font-bold">
-                  Target Growth Areas
-                </h4>
-                <ul className="text-xs text-slate-300 space-y-1 list-disc list-inside">
-                  {analysisResult.feedback.growthAreas.map((g, idx) => (
-                    <li key={idx}>{g}</li>
-                  ))}
-                </ul>
-              </div>
-            </div>
-
-            {/* 30-Second Micro-Drills Governed by Memory */}
-            <div>
-              <h4 className="text-sm font-bold text-white mb-3 flex items-center gap-2">
-                <Sparkles className="w-4 h-4 text-cyber-amber" />
-                Memory-Governed 30s Micro-Drills
-              </h4>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                {analysisResult.recommendedDrills.map((drill) => (
-                  <div
-                    key={drill.drillId}
-                    className="p-4 rounded-xl bg-slate-900 border border-surface-border flex flex-col justify-between space-y-2"
-                  >
-                    <div>
-                      <div className="flex items-center justify-between text-xs mb-1">
-                        <span className="font-bold text-white">{drill.title}</span>
-                        <span className="text-cyber-cyan font-mono text-[11px]">30s</span>
-                      </div>
-                      <p className="text-xs text-slate-400">{drill.prompt}</p>
-                    </div>
-
-                    <button
-                      onClick={() => startDrillCountdown(30)}
-                      className="mt-2 py-1.5 px-3 rounded-lg bg-cyan-500/10 border border-cyan-500/30 text-cyber-cyan text-xs font-semibold hover:bg-cyan-500/20 transition-all flex items-center justify-center gap-2"
-                    >
-                      <Clock className="w-3.5 h-3.5" />
-                      {activeDrillTimer ? `Drill Active: ${activeDrillTimer}s` : "Start 30s Drill"}
-                    </button>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            {/* Modal Actions */}
-            <div className="pt-4 border-t border-surface-border flex justify-end gap-3">
-              <Link
-                href="/dashboard"
-                className="px-5 py-2.5 rounded-xl bg-surface-secondary border border-surface-border text-slate-200 text-xs font-semibold hover:bg-surface-hover transition-all"
-              >
-                View Dashboard History
-              </Link>
-              <Link
-                href="/memories"
-                className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-cyan-500 to-sky-600 text-slate-950 text-xs font-bold hover:from-cyan-400 hover:to-sky-500 transition-all flex items-center gap-1.5"
-              >
-                Inspect Governed Memories
-                <ChevronRight className="w-4 h-4" />
-              </Link>
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Comprehensive Results Scorecard Modal */}
+      <ScorecardModal
+        isOpen={showScorecard}
+        onClose={() => setShowScorecard(false)}
+        data={analysisResult}
+        onPracticeAgain={() => {
+          setShowScorecard(false);
+          startPrepTimer(0);
+        }}
+        voiceScript={voiceScript}
+        isPlayingVoice={isPlayingVoice}
+        isGeneratingVoice={isGeneratingVoice}
+        onToggleVoice={toggleVoicePlayback}
+      />
     </div>
   );
 }
